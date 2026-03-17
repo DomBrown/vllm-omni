@@ -15,13 +15,15 @@ stage_args:
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       enforce_eager: false
       trust_remote_code: true
-      async_scheduling: true
+      async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: latent
       gpu_memory_utilization: 0.3
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 512
       max_model_len: 4096
+      profiler_config:
+        profiler: cuda
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
     # Use named connector to apply runtime.connectors.extra.
     output_connectors:
@@ -48,9 +50,9 @@ stage_args:
         architectures: [Qwen3TTSCode2Wav]
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      enforce_eager: true
+      enforce_eager: false
       trust_remote_code: true
-      async_scheduling: true
+      async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: audio
       gpu_memory_utilization: 0.2
@@ -59,6 +61,8 @@ stage_args:
       max_num_batched_tokens: 8192
       # async_chunk appends windows per step; max_model_len must cover accumulated stream.
       max_model_len: 32768
+      profiler_config:
+        profiler: cuda
     engine_input_source: [0]
     final_output: true
     final_output_type: audio

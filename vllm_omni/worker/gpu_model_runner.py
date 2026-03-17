@@ -23,6 +23,8 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
+from vllm.v1.utils import record_function_or_nullcontext
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 else:
@@ -1013,18 +1015,18 @@ class OmniGPUModelRunner(GPUModelRunner):
     ) -> None:
         """Process model-provided per-request updates and merge into model_intermediate_buffer."""
         try:
-            # execute the custom postprocess function
-            # TODO(Peiqi): do we have a more elegant way to do this?
             if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
-                for req_index, req_id in enumerate(self.input_batch.req_ids):
-                    req_infos = self.model_intermediate_buffer.get(req_id, {})
-                    start_offset = int(self.query_start_loc.cpu[req_index])
-                    sched_tokens = int(num_scheduled_tokens_np[req_index])
-                    s, e = start_offset, start_offset + sched_tokens
-                    # only consider to store data into update dict.
-                    hidden_states_slice = hidden_states[s:e]
-                    update_dict = self.model.postprocess(hidden_states_slice, **req_infos)
-                    self._update_intermediate_buffer(req_id, update_dict)
+                with record_function_or_nullcontext("postprocess: model.postprocess loop"):
+                    for req_index, req_id in enumerate(self.input_batch.req_ids):
+                        req_infos = self.model_intermediate_buffer.get(req_id, {})
+                        start_offset = int(self.query_start_loc.cpu[req_index])
+                        sched_tokens = int(num_scheduled_tokens_np[req_index])
+                        s, e = start_offset, start_offset + sched_tokens
+                        hidden_states_slice = hidden_states[s:e]
+                        with record_function_or_nullcontext("postprocess: model.postprocess call"):
+                            update_dict = self.model.postprocess(hidden_states_slice, **req_infos)
+                        with record_function_or_nullcontext("postprocess: update_intermediate_buffer"):
+                            self._update_intermediate_buffer(req_id, update_dict)
         except Exception as e:
             logger.error(
                 f"Error merging for requests:{self.input_batch.req_ids} "
@@ -1223,54 +1225,60 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._update_additional_information(scheduler_output)
 
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
-            # Overlay custom prompt_embeds per request for the prompt portion;
-            # collect additional_information (tensor/list) for prefill portion only
-            decode_req_ids = []
-            for req_index, req_id in enumerate(self.input_batch.req_ids):
-                req_infos = self.model_intermediate_buffer.get(req_id, {})
+            with record_function_or_nullcontext("preprocessor: model.preprocess"):
+                # Overlay custom prompt_embeds per request for the prompt portion;
+                # collect additional_information (tensor/list) for prefill portion only
+                decode_req_ids = []
+                if self.vllm_config.model_config.async_chunk:
+                    self._update_additional_information(scheduler_output)
+                for req_index, req_id in enumerate(self.input_batch.req_ids):
+                    req_infos = self.model_intermediate_buffer.get(req_id, {})
 
-                # mimo-audio check
-                req_state = self.requests.get(req_id)
-                req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
+                    # mimo-audio check
+                    req_state = self.requests.get(req_id)
+                    req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
 
-                start_offset = int(self.query_start_loc.cpu[req_index])
-                sched_tokens = int(num_scheduled_tokens_np[req_index])
-                s, e = start_offset, start_offset + sched_tokens
-                span_len = int(e) - int(s)
+                    start_offset = int(self.query_start_loc.cpu[req_index])
+                    sched_tokens = int(num_scheduled_tokens_np[req_index])
+                    s, e = start_offset, start_offset + sched_tokens
+                    span_len = int(e) - int(s)
 
-                # call the custom process function
-                embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
-                req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
-                )
-                if inputs_embeds is None:
-                    inputs_embeds = torch.empty(
-                        (input_ids.shape[0], req_embeds.shape[-1]),
-                        device=req_embeds.device,
-                        dtype=req_embeds.dtype,
-                    )
+                    # call the custom process function
+                    embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
+                    with record_function_or_nullcontext("preprocessor: model.preprocess call"):
+                        req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                            input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                        )
+                    if inputs_embeds is None:
+                        inputs_embeds = torch.empty(
+                            (input_ids.shape[0], req_embeds.shape[-1]),
+                            device=req_embeds.device,
+                            dtype=req_embeds.dtype,
+                        )
 
-                if hasattr(self.model, "talker_mtp") and span_len == 1:
-                    last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
-                    decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
-                    self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
-                    self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
-                    self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
-                    self.text_step.gpu[decode_slice].copy_(text_step)
-                    decode_req_ids.append(req_id)
+                    with record_function_or_nullcontext("preprocessor: mtp buffer copy"):
+                        if hasattr(self.model, "talker_mtp") and span_len == 1:
+                            last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
+                            decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
+                            self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
+                            self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
+                            self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
+                            self.text_step.gpu[decode_slice].copy_(text_step)
+                            decode_req_ids.append(req_id)
 
-                # TODO(Peiqi): the merge stage could move out from the critical path
-                self._merge_additional_information_update(req_id, update_dict)
+                    with record_function_or_nullcontext("preprocessor: merge_additional_information"):
+                        self._merge_additional_information_update(req_id, update_dict)
 
-                # update the inputs_embeds and input_ids
-                seg_len = min(span_len, req_embeds.shape[0])
-                inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
-                if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
-                    input_ids[s : s + seg_len] = req_input_ids
+                    with record_function_or_nullcontext("preprocessor: update inputs_embeds"):
+                        seg_len = min(span_len, req_embeds.shape[0])
+                        inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
+                        if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
+                            input_ids[s : s + seg_len] = req_input_ids
 
-            # run talker mtp decode
-            if hasattr(self.model, "talker_mtp"):
-                self._talker_mtp_forward(decode_req_ids, inputs_embeds)
+            with record_function_or_nullcontext("talker_mtp: forward"):
+                # run talker mtp decode
+                if hasattr(self.model, "talker_mtp"):
+                    self._talker_mtp_forward(decode_req_ids, inputs_embeds)
 
         return (
             input_ids,
@@ -1285,34 +1293,36 @@ class OmniGPUModelRunner(GPUModelRunner):
         decode_batch_size = len(decode_req_ids)
         if decode_batch_size == 0:
             return
-        _cudagraph_mode, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
-            num_tokens=decode_batch_size,
-            num_reqs=decode_batch_size,
-            num_scheduled_tokens_np=np.ones(decode_batch_size, dtype=np.int32),
-            max_num_scheduled_tokens=1,
-            use_cascade_attn=False,
-        )
-        # Force eager for unwrapped code predictors (AR loops / multinomial).
-        if not isinstance(self.talker_mtp, CUDAGraphWrapper):
-            _cudagraph_mode = CUDAGraphMode.NONE
-        num_tokens_padded = batch_desc.num_tokens
-        req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
-        req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
-        last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
-        text_step = self.text_step.gpu[:num_tokens_padded]
-        with set_forward_context(
-            None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
-        ):
-            req_embeds, code_predictor_codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
-        # update the inputs_embeds and code_predictor_codes
-        code_predictor_codes_cpu = code_predictor_codes.detach().to("cpu").contiguous()
-        out_key = getattr(self.model, "talker_mtp_output_key", "code_predictor_codes")
-        for idx, req_id in enumerate(decode_req_ids):
-            req_index = self.input_batch.req_ids.index(req_id)
-            start_offset = int(self.query_start_loc.cpu[req_index])
-            inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
-            update_dict = {out_key: code_predictor_codes_cpu[idx : idx + 1]}
-            self._merge_additional_information_update(req_id, update_dict)
+        with record_function_or_nullcontext("talker_mtp: batch setup"):
+            _cudagraph_mode, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
+                num_tokens=decode_batch_size,
+                num_reqs=decode_batch_size,
+                num_scheduled_tokens_np=np.ones(decode_batch_size, dtype=np.int32),
+                max_num_scheduled_tokens=1,
+                use_cascade_attn=False,
+            )
+            # Force eager for unwrapped code predictors (AR loops / multinomial).
+            if not isinstance(self.talker_mtp, CUDAGraphWrapper):
+                _cudagraph_mode = CUDAGraphMode.NONE
+            num_tokens_padded = batch_desc.num_tokens
+            req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
+            req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
+            last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
+            text_step = self.text_step.gpu[:num_tokens_padded]
+        with record_function_or_nullcontext("talker_mtp: model call"):
+            with set_forward_context(
+                None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
+            ):
+                req_embeds, code_predictor_codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
+        with record_function_or_nullcontext("talker_mtp: postprocess writeback"):
+            code_predictor_codes_cpu = code_predictor_codes.detach().to("cpu").contiguous()
+            out_key = getattr(self.model, "talker_mtp_output_key", "code_predictor_codes")
+            for idx, req_id in enumerate(decode_req_ids):
+                req_index = self.input_batch.req_ids.index(req_id)
+                start_offset = int(self.query_start_loc.cpu[req_index])
+                inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
+                update_dict = {out_key: code_predictor_codes_cpu[idx : idx + 1]}
+                self._merge_additional_information_update(req_id, update_dict)
 
     def _model_forward(
         self,
@@ -1323,20 +1333,22 @@ class OmniGPUModelRunner(GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ):
         """Inject omni-specific kwargs into forward and cache model output"""
-        model_kwargs_extra = self._build_model_kwargs_extra()
+        with record_function_or_nullcontext("forward: build_model_kwargs_extra"):
+            model_kwargs_extra = self._build_model_kwargs_extra()
 
-        model_output = super()._model_forward(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-            **model_kwargs_extra,
-        )
-        if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
-            model_output = self.model.make_omni_output(model_output, **model_kwargs_extra)
-        # Cache model output so later sample_tokens can consume multimodal results.
-        self._omni_last_model_output = model_output
+        with record_function_or_nullcontext("forward: super._model_forward"):
+            model_output = super()._model_forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+                **model_kwargs_extra,
+            )
+        with record_function_or_nullcontext("forward: make_omni_output"):
+            if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
+                model_output = self.model.make_omni_output(model_output, **model_kwargs_extra)
+            self._omni_last_model_output = model_output
         return model_output
 
     def _update_intermediate_buffer(self, req_id: str, upd: dict) -> None:

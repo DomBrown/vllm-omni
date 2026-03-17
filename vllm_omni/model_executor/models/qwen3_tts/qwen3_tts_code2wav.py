@@ -11,6 +11,7 @@ from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .qwen3_tts_tokenizer import Qwen3TTSTokenizer
@@ -201,42 +202,43 @@ class Qwen3TTSCode2Wav(nn.Module):
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
             )
 
-        ids = input_ids.reshape(-1).to(dtype=torch.long)
-        request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
+        with record_function_or_nullcontext("code2wav: parse input_ids"):
+            ids = input_ids.reshape(-1).to(dtype=torch.long)
+            request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
-        parsed: list[tuple[int, int]] = []
-        valid_codes_qf: list[torch.Tensor] = []
-        valid_indices: list[int] = []
-        left_context_size = [0] * len(request_ids_list)
-        if runtime_additional_information is not None:
-            for i, info in enumerate(runtime_additional_information):
-                if i >= len(left_context_size):
-                    break
-                if "left_context_size" in info:
-                    left_context_size[i] = info["left_context_size"]
-        for i, req_ids in enumerate(request_ids_list):
-            if req_ids.numel() < 1:
-                parsed.append((0, 0))
-                continue
-            ctx_frames = left_context_size[i]
-            flat = req_ids
-            n = flat.numel()
-            if n == 0 or n % q != 0:
-                if n > 0:
-                    logger.warning(
-                        "Code2Wav input_ids length %d not divisible by num_quantizers %d, "
-                        "likely a warmup run; returning empty audio.",
-                        n,
-                        q,
-                    )
-                parsed.append((0, 0))
-                continue
-            frames = n // q
-            # [q*F] -> [Q, F] for direct decoder call (decoder expects [B, Q, F])
-            codes_qf = flat.reshape(q, frames)
-            parsed.append((ctx_frames, frames))
-            valid_codes_qf.append(codes_qf)
-            valid_indices.append(i)
+            parsed: list[tuple[int, int]] = []
+            valid_codes_qf: list[torch.Tensor] = []
+            valid_indices: list[int] = []
+            left_context_size = [0] * len(request_ids_list)
+            if runtime_additional_information is not None:
+                for i, info in enumerate(runtime_additional_information):
+                    if i >= len(left_context_size):
+                        break
+                    if "left_context_size" in info:
+                        left_context_size[i] = info["left_context_size"]
+            for i, req_ids in enumerate(request_ids_list):
+                if req_ids.numel() < 1:
+                    parsed.append((0, 0))
+                    continue
+                ctx_frames = left_context_size[i]
+                flat = req_ids
+                n = flat.numel()
+                if n == 0 or n % q != 0:
+                    if n > 0:
+                        logger.warning(
+                            "Code2Wav input_ids length %d not divisible by num_quantizers %d, "
+                            "likely a warmup run; returning empty audio.",
+                            n,
+                            q,
+                        )
+                    parsed.append((0, 0))
+                    continue
+                frames = n // q
+                # [q*F] -> [Q, F] for direct decoder call (decoder expects [B, Q, F])
+                codes_qf = flat.reshape(q, frames)
+                parsed.append((ctx_frames, frames))
+                valid_codes_qf.append(codes_qf)
+                valid_indices.append(i)
 
         num_req = len(request_ids_list)
         if not valid_codes_qf:
@@ -264,42 +266,41 @@ class Qwen3TTSCode2Wav(nn.Module):
             except Exception:
                 pass
 
-        # Decode directly via decoder.chunked_decode(), staying entirely on GPU.
-        # For single request: no padding needed, fast path.
-        # For multiple requests: decode each individually to avoid padding overhead.
-        wav_tensors: list[torch.Tensor] = []
-        if len(valid_codes_qf) == 1:
-            codes_bqf = valid_codes_qf[0].unsqueeze(0)  # [1, Q, F]
-            wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
-            wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
-        else:
-            for codes_qf in valid_codes_qf:
-                codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
-                wav = decoder.chunked_decode(codes_bqf)
-                wav_tensors.append(wav.squeeze(0).squeeze(0))
+        with record_function_or_nullcontext("code2wav: decoder.chunked_decode"):
+            wav_tensors: list[torch.Tensor] = []
+            if len(valid_codes_qf) == 1:
+                codes_bqf = valid_codes_qf[0].unsqueeze(0)  # [1, Q, F]
+                wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
+                wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
+            else:
+                for codes_qf in valid_codes_qf:
+                    codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
+                    wav = decoder.chunked_decode(codes_bqf)
+                    wav_tensors.append(wav.squeeze(0).squeeze(0))
 
-        audios: list[torch.Tensor] = [empty] * num_req
-        srs = [sr_tensor] * num_req
+        with record_function_or_nullcontext("code2wav: audio trim + output"):
+            audios: list[torch.Tensor] = [empty] * num_req
+            srs = [sr_tensor] * num_req
 
-        for j, idx in enumerate(valid_indices):
-            ctx_frames, actual_frames = parsed[idx]
-            wav = wav_tensors[j]
-            expected_len = actual_frames * upsample
-            if wav.shape[0] > expected_len:
-                wav = wav[:expected_len]
-            if ctx_frames > 0:
-                cut = ctx_frames * upsample
-                if cut < wav.shape[0]:
-                    wav = wav[cut:]
-                else:
-                    logger.warning(
-                        "Context trim %d >= decoded length %d; returning empty audio.",
-                        cut,
-                        wav.shape[0],
-                    )
-                    continue
-            if wav.shape[0] > 0:
-                audios[idx] = wav.to(dtype=torch.float32).reshape(-1)
+            for j, idx in enumerate(valid_indices):
+                ctx_frames, actual_frames = parsed[idx]
+                wav = wav_tensors[j]
+                expected_len = actual_frames * upsample
+                if wav.shape[0] > expected_len:
+                    wav = wav[:expected_len]
+                if ctx_frames > 0:
+                    cut = ctx_frames * upsample
+                    if cut < wav.shape[0]:
+                        wav = wav[cut:]
+                    else:
+                        logger.warning(
+                            "Context trim %d >= decoded length %d; returning empty audio.",
+                            cut,
+                            wav.shape[0],
+                        )
+                        continue
+                if wav.shape[0] > 0:
+                    audios[idx] = wav.to(dtype=torch.float32).reshape(-1)
 
         return OmniOutput(
             text_hidden_states=None,

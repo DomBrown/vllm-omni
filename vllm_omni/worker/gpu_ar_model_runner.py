@@ -138,8 +138,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
-            # Update persistent batch states.
-            self._update_states(scheduler_output)
+            with record_function_or_nullcontext("preprocess: _update_states"):
+                self._update_states(scheduler_output)
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -180,10 +180,11 @@ class GPUARModelRunner(OmniGPUModelRunner):
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            logits_indices, spec_decode_metadata = self._prepare_inputs(
-                scheduler_output,
-                num_scheduled_tokens_np,
-            )
+            with record_function_or_nullcontext("preprocess: _prepare_inputs"):
+                logits_indices, spec_decode_metadata = self._prepare_inputs(
+                    scheduler_output,
+                    num_scheduled_tokens_np,
+                )
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -243,28 +244,30 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 ubatch_slices=ubatch_slices_padded,
             )
 
-            attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
-                num_tokens=num_tokens_unpadded,
-                num_tokens_padded=num_tokens_padded if pad_attn else None,
-                num_reqs=num_reqs,
-                num_reqs_padded=num_reqs_padded if pad_attn else None,
-                max_query_len=max_num_scheduled_tokens,
-                ubatch_slices=ubatch_slices_attn,
-                logits_indices=logits_indices,
-                use_spec_decode=use_spec_decode,
-                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                slot_mappings=slot_mappings_by_group,
-            )
+            with record_function_or_nullcontext("preprocess: _build_attention_metadata"):
+                attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
+                    num_tokens=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded if pad_attn else None,
+                    max_query_len=max_num_scheduled_tokens,
+                    ubatch_slices=ubatch_slices_attn,
+                    logits_indices=logits_indices,
+                    use_spec_decode=use_spec_decode,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    slot_mappings=slot_mappings_by_group,
+                )
 
-            (
-                input_ids,
-                inputs_embeds,
-                positions,
-                intermediate_tensors,
-                model_kwargs,
-                ec_connector_output,
-            ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
+            with record_function_or_nullcontext("preprocess: _preprocess (omni)"):
+                (
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                    intermediate_tensors,
+                    model_kwargs,
+                    ec_connector_output,
+                ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -306,20 +309,25 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 sampler=self.sampler,
             )
 
-            # [Omni] Map pending ropes metadata to req_ids.
-            if hasattr(self.model, "flush_pending_metadata"):
-                self.model.flush_pending_metadata(list(req_ids))
+            with record_function_or_nullcontext("forward: flush_pending_metadata"):
+                if hasattr(self.model, "flush_pending_metadata"):
+                    self.model.flush_pending_metadata(list(req_ids))
+
+            with record_function_or_nullcontext("forward: end_of_with_body"):
+                pass
+        # Gap between here and postprocess is set_forward_context / kv_connector __exit__
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
-            else:
-                # Common case.
-                hidden_states = model_output
-                aux_hidden_states = None
+            with record_function_or_nullcontext("postprocess: extract outputs"):
+                if self.use_aux_hidden_state_outputs:
+                    # True when EAGLE 3 is used.
+                    hidden_states, aux_hidden_states = model_output
+                else:
+                    # Common case.
+                    hidden_states = model_output
+                    aux_hidden_states = None
 
-            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -339,14 +347,15 @@ class GPUARModelRunner(OmniGPUModelRunner):
                         kv_connector_output,
                     )
 
-                sample_hidden_states = hidden_states[logits_indices]
-                # Try with sampling_metadata first; fall back to without for models that don't support it
-                try:
-                    logits = self.model.compute_logits(
-                        sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
-                    )
-                except TypeError:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                with record_function_or_nullcontext("postprocess: compute_logits"):
+                    sample_hidden_states = hidden_states[logits_indices]
+                    # Try with sampling_metadata first; fall back to without for models that don't support it
+                    try:
+                        logits = self.model.compute_logits(
+                            sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
+                        )
+                    except TypeError:
+                        logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -546,7 +555,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
-        hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
+        with record_function_or_nullcontext("sample_tokens: hidden_states to cpu"):
+            hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
         if num_scheduled_tokens_np is None:
             req_ids = self.input_batch.req_ids
@@ -555,41 +565,43 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 dtype=np.int32,
             )
 
-        self._process_additional_information_updates(
-            hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
-        )
+        with record_function_or_nullcontext("sample_tokens: process_additional_information"):
+            self._process_additional_information_updates(
+                hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
+            )
 
-        pooler_output: list[dict[str, object]] = []
-        for rid in req_ids_output_copy:
-            idx = req_id_to_index_output_copy[rid]
-            start = int(self.query_start_loc.cpu[idx])
-            sched = int(num_scheduled_tokens_np[idx])
-            end = start + sched
-            hidden_slice = hidden_states_cpu[start:end]
-            payload: dict[str, object] = {"hidden": hidden_slice}
-            if isinstance(multimodal_outputs, dict) and multimodal_outputs:
-                mm_payload: dict[str, object] = {}
-                for k, v in multimodal_outputs.items():
-                    try:
-                        if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
-                            mm_payload[k] = v.detach().to("cpu")[start:end].contiguous()
-                        elif isinstance(v, dict):
-                            sub_dict: dict[str, torch.Tensor] = {}
-                            for sk, sv in v.items():
-                                if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
-                                    sub_dict[str(sk)] = sv.detach().to("cpu")[start:end].contiguous()
-                            if sub_dict:
-                                mm_payload[k] = sub_dict
-                        elif isinstance(v, list):
-                            element = v[0]
-                            if isinstance(element, torch.Tensor):
-                                element = element.detach().to("cpu").contiguous()
-                            mm_payload[k] = element
-                    except Exception as e:
-                        logger.error(f"Error in merge multimodal outputs: {e}")
-                if mm_payload:
-                    payload.update(mm_payload)
-            pooler_output.append(payload)
+        with record_function_or_nullcontext("sample_tokens: build pooler_output"):
+            pooler_output: list[dict[str, object]] = []
+            for rid in req_ids_output_copy:
+                idx = req_id_to_index_output_copy[rid]
+                start = int(self.query_start_loc.cpu[idx])
+                sched = int(num_scheduled_tokens_np[idx])
+                end = start + sched
+                hidden_slice = hidden_states_cpu[start:end]
+                payload: dict[str, object] = {"hidden": hidden_slice}
+                if isinstance(multimodal_outputs, dict) and multimodal_outputs:
+                    mm_payload: dict[str, object] = {}
+                    for k, v in multimodal_outputs.items():
+                        try:
+                            if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                                mm_payload[k] = v.detach().to("cpu")[start:end].contiguous()
+                            elif isinstance(v, dict):
+                                sub_dict: dict[str, torch.Tensor] = {}
+                                for sk, sv in v.items():
+                                    if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
+                                        sub_dict[str(sk)] = sv.detach().to("cpu")[start:end].contiguous()
+                                if sub_dict:
+                                    mm_payload[k] = sub_dict
+                            elif isinstance(v, list):
+                                element = v[0]
+                                if isinstance(element, torch.Tensor):
+                                    element = element.detach().to("cpu").contiguous()
+                                mm_payload[k] = element
+                        except Exception as e:
+                            logger.error(f"Error in merge multimodal outputs: {e}")
+                    if mm_payload:
+                        payload.update(mm_payload)
+                pooler_output.append(payload)
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.model_config.enable_return_routed_experts:
                 capturer = RoutedExpertsCapturer.get_instance()

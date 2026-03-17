@@ -20,6 +20,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.utils import is_pp_missing_parameter
+from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_omni.platforms import current_omni_platform
 
@@ -475,30 +476,31 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
                 "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
             )
 
-        for step in range(1, num_groups):
-            seq_len = step + 1
+        with record_function_or_nullcontext("talker_mtp: code_predictor: decode_logits"):
+            for step in range(1, num_groups):
+                seq_len = step + 1
 
-            projected = proj_buf[:bsz, :seq_len, :]
-            step_pos_ids = pos_ids[:seq_len] if bsz == 1 else pos_ids[:seq_len].repeat(bsz)
+                projected = proj_buf[:bsz, :seq_len, :]
+                step_pos_ids = pos_ids[:seq_len] if bsz == 1 else pos_ids[:seq_len].repeat(bsz)
 
-            hidden_out = model_fwd(projected, step_pos_ids)
+                hidden_out = model_fwd(projected, step_pos_ids)
 
-            logits = lm_heads[step - 1](hidden_out[:, -1, :])
+                logits = lm_heads[step - 1](hidden_out[:, -1, :])
 
-            if use_sampling:
-                scaled = logits * inv_temperature
-                if top_k > 0:
-                    topk_vals, _ = scaled.topk(top_k, dim=-1)
-                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                probs = F.softmax(scaled, dim=-1)
-                next_ids = torch.multinomial(probs, num_samples=1)
-            else:
-                next_ids = logits.argmax(dim=-1, keepdim=True)
+                if use_sampling:
+                    scaled = logits * inv_temperature
+                    if top_k > 0:
+                        topk_vals, _ = scaled.topk(top_k, dim=-1)
+                        scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                    probs = F.softmax(scaled, dim=-1)
+                    next_ids = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_ids = logits.argmax(dim=-1, keepdim=True)
 
-            all_codes[:, step] = next_ids.reshape(bsz)
+                all_codes[:, step] = next_ids.reshape(bsz)
 
-            if step < num_groups - 1:
-                new_embed = codec_embeds[step - 1](next_ids)
-                proj_buf[:bsz, step + 1, :] = projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
+                if step < num_groups - 1:
+                    new_embed = codec_embeds[step - 1](next_ids)
+                    proj_buf[:bsz, step + 1, :] = projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
 
         return all_codes
