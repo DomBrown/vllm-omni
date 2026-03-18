@@ -403,7 +403,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._cudagraph_wrapper = None
 
         # Keys that should stay on GPU in model_intermediate_buffer to avoid CPU↔GPU round-trips
-        self.gpu_resident_buffer_keys: set[str] = {"last_talker_hidden"}
+        self.gpu_resident_buffer_keys: set[str] = {"last_talker_hidden", "audio_codes"}
 
     # -------------------- vLLM required hooks --------------------
 
