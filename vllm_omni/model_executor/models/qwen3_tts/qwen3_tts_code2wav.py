@@ -264,19 +264,31 @@ class Qwen3TTSCode2Wav(nn.Module):
             except Exception:
                 pass
 
-        # Decode directly via decoder.chunked_decode(), staying entirely on GPU.
-        # For single request: no padding needed, fast path.
-        # For multiple requests: decode each individually to avoid padding overhead.
-        wav_tensors: list[torch.Tensor] = []
+        # Decode via a single batched decoder.chunked_decode() call,
+        # padding shorter requests to Fmax with zeros on the right.
+        # The decoder uses causal convolutions so right-padding has
+        # negligible effect on earlier positions.
+        actual_frames_list = [c.shape[1] for c in valid_codes_qf]
+        f_max = max(actual_frames_list)
+
         if len(valid_codes_qf) == 1:
             codes_bqf = valid_codes_qf[0].unsqueeze(0)  # [1, Q, F]
-            wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
-            wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
         else:
+            padded: list[torch.Tensor] = []
             for codes_qf in valid_codes_qf:
-                codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
-                wav = decoder.chunked_decode(codes_bqf)
-                wav_tensors.append(wav.squeeze(0).squeeze(0))
+                f_i = codes_qf.shape[1]
+                if f_i < f_max:
+                    codes_qf = torch.nn.functional.pad(codes_qf, (0, f_max - f_i))
+                padded.append(codes_qf)
+            codes_bqf = torch.stack(padded, dim=0)  # [B, Q, Fmax]
+
+        wav_batch = decoder.chunked_decode(codes_bqf)  # [B, 1, wav_len_max]
+
+        wav_tensors: list[torch.Tensor] = []
+        for j, f_actual in enumerate(actual_frames_list):
+            wav_j = wav_batch[j].squeeze(0)  # [wav_len_max]
+            expected_len = f_actual * upsample
+            wav_tensors.append(wav_j[:expected_len])
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
