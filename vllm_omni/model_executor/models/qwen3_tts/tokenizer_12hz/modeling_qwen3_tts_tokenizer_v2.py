@@ -879,6 +879,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
     def enable_cudagraph(
         self,
         capture_sizes: list[int] | None = None,
+        capture_batch_sizes: list[int] | None = None,
         device: torch.device | None = None,
     ):
         from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
@@ -891,13 +892,15 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self._cudagraph_wrapper = CUDAGraphDecoderWrapper(
             decoder=self,
             capture_sizes=capture_sizes,
+            capture_batch_sizes=capture_batch_sizes,
             num_quantizers=self.config.num_quantizers,
             enabled=True,
         )
         self._cudagraph_wrapper.warmup(device, dtype=torch.long)
         self._cudagraph_enabled = True
         sizes = self._cudagraph_wrapper.capture_sizes
-        logger.info("CUDA Graph enabled for decoder with sizes: %s", sizes)
+        batch_sizes = self._cudagraph_wrapper.capture_batch_sizes
+        logger.info("CUDA Graph enabled for decoder with sizes: %s, batch_sizes: %s", sizes, batch_sizes)
 
     def disable_cudagraph(self):
         self._cudagraph_enabled = False

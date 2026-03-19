@@ -18,11 +18,16 @@ class CUDAGraphDecoderWrapper:
     """
     CUDA Graph wrapper for Qwen3TTSTokenizerV2Decoder.
 
-    This wrapper captures the decoder forward pass for fixed input sizes
-    and replays them during inference to reduce kernel launch overhead.
+    This wrapper captures the decoder forward pass for fixed
+    (batch_size, seq_len) combinations and replays them during inference
+    to reduce kernel launch overhead.
 
     Usage:
-        wrapper = CUDAGraphDecoderWrapper(decoder, capture_sizes=[25, 50, 100, 200, 300])
+        wrapper = CUDAGraphDecoderWrapper(
+            decoder,
+            capture_sizes=[25, 50, 100, 200, 300],
+            capture_batch_sizes=[1, 2, 4],
+        )
         wrapper.warmup(device)
 
         # During inference:
@@ -30,22 +35,25 @@ class CUDAGraphDecoderWrapper:
     """
 
     DEFAULT_CAPTURE_SIZES = [2, 4, 8, 16, 25, 32, 50, 100, 150, 200, 250, 300]
+    DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
     def __init__(
         self,
         decoder: torch.nn.Module,
         capture_sizes: list[int] | None = None,
+        capture_batch_sizes: list[int] | None = None,
         num_quantizers: int = 8,
         enabled: bool = True,
     ):
         self.decoder = decoder
         self.capture_sizes = capture_sizes or self.DEFAULT_CAPTURE_SIZES
+        self.capture_batch_sizes = capture_batch_sizes or self.DEFAULT_CAPTURE_BATCH_SIZES
         self.num_quantizers = num_quantizers
         self.enabled = enabled
 
-        self.graphs: dict[int, CUDAGraph] = {}
-        self.static_inputs: dict[int, torch.Tensor] = {}
-        self.static_outputs: dict[int, torch.Tensor] = {}
+        self.graphs: dict[tuple[int, int], CUDAGraph] = {}
+        self.static_inputs: dict[tuple[int, int], torch.Tensor] = {}
+        self.static_outputs: dict[tuple[int, int], torch.Tensor] = {}
 
         self._warmed_up = False
         self._device = None
@@ -72,35 +80,57 @@ class CUDAGraphDecoderWrapper:
         self._device = device
         self.decoder.eval()
 
-        logger.info("Starting CUDA Graph warmup for %d sizes: %s", len(self.capture_sizes), self.capture_sizes)
+        num_combos = len(self.capture_batch_sizes) * len(self.capture_sizes)
+        logger.info(
+            "Starting CUDA Graph warmup for %d combinations: batch_sizes=%s x seq_sizes=%s",
+            num_combos,
+            self.capture_batch_sizes,
+            self.capture_sizes,
+        )
 
-        # Warmup runs to ensure CUDA memory is allocated
-        for size in self.capture_sizes:
-            dummy_codes = torch.zeros(
-                1,
-                self.num_quantizers,
-                size,
-                dtype=dtype,
-                device=device,
-            )
-            with torch.no_grad():
-                _ = self.decoder(dummy_codes)
+        for batch_size in self.capture_batch_sizes:
+            for size in self.capture_sizes:
+                dummy_codes = torch.zeros(
+                    batch_size,
+                    self.num_quantizers,
+                    size,
+                    dtype=dtype,
+                    device=device,
+                )
+                with torch.no_grad():
+                    _ = self.decoder(dummy_codes)
 
         torch.cuda.synchronize(device)
 
-        for size in self.capture_sizes:
-            try:
-                self._capture_graph_for_size(size, device, dtype)
-                logger.info("  Captured CUDA Graph for size=%d", size)
-            except Exception:
-                logger.warning("  Failed to capture CUDA Graph for size=%d", size, exc_info=True)
+        for batch_size in self.capture_batch_sizes:
+            for size in self.capture_sizes:
+                try:
+                    self._capture_graph(batch_size, size, device, dtype)
+                    logger.info(
+                        "  Captured CUDA Graph for batch_size=%d, size=%d",
+                        batch_size,
+                        size,
+                    )
+                except Exception:
+                    logger.warning(
+                        "  Failed to capture CUDA Graph for batch_size=%d, size=%d",
+                        batch_size,
+                        size,
+                        exc_info=True,
+                    )
 
         self._warmed_up = True
         logger.info("CUDA Graph warmup complete. Captured %d graphs.", len(self.graphs))
 
-    def _capture_graph_for_size(self, size: int, device: torch.device, dtype: torch.dtype):
+    def _capture_graph(
+        self,
+        batch_size: int,
+        size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
         static_input = torch.zeros(
-            1,
+            batch_size,
             self.num_quantizers,
             size,
             dtype=dtype,
@@ -117,29 +147,29 @@ class CUDAGraphDecoderWrapper:
             with torch.cuda.graph(graph):
                 static_output = self.decoder(static_input)
 
-        self.graphs[size] = graph
-        self.static_inputs[size] = static_input
-        self.static_outputs[size] = static_output
+        key = (batch_size, size)
+        self.graphs[key] = graph
+        self.static_inputs[key] = static_input
+        self.static_outputs[key] = static_output
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         if not self.enabled or not self._warmed_up:
             return self.decoder(codes)
 
-        if codes.shape[0] != 1:
-            return self.decoder(codes)
-
+        batch_size = codes.shape[0]
         actual_size = codes.shape[-1]
         padded_size = self._get_padded_size(actual_size)
 
-        if padded_size is None or padded_size not in self.graphs:
+        key = (batch_size, padded_size) if padded_size is not None else None
+        if key is None or key not in self.graphs:
             return self.decoder(codes)
 
-        self.static_inputs[padded_size].zero_()
-        self.static_inputs[padded_size][:, :, :actual_size] = codes
+        self.static_inputs[key].zero_()
+        self.static_inputs[key][:, :, :actual_size] = codes
 
-        self.graphs[padded_size].replay()
+        self.graphs[key].replay()
 
-        output = self.static_outputs[padded_size]
+        output = self.static_outputs[key]
         total_upsample = self.decoder.total_upsample
         actual_output_len = actual_size * total_upsample
 

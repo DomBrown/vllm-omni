@@ -83,7 +83,7 @@ def decoder():
 
 @pytest.fixture(scope="module")
 def wrapper(decoder):
-    """Create a warmed-up CUDAGraphDecoderWrapper."""
+    """Create a warmed-up CUDAGraphDecoderWrapper (BS=1 only)."""
     w = CUDAGraphDecoderWrapper(
         decoder=decoder,
         capture_sizes=[25, 50, 100],
@@ -94,8 +94,22 @@ def wrapper(decoder):
     return w
 
 
-def _random_codes(seq_len, device=DEVICE):
-    return torch.randint(0, 100, (1, NUM_QUANTIZERS, seq_len), dtype=torch.long, device=device)
+@pytest.fixture(scope="module")
+def batched_wrapper(decoder):
+    """Create a warmed-up CUDAGraphDecoderWrapper with batched captures."""
+    w = CUDAGraphDecoderWrapper(
+        decoder=decoder,
+        capture_sizes=[25, 50, 100],
+        capture_batch_sizes=[1, 2, 4],
+        num_quantizers=NUM_QUANTIZERS,
+        enabled=True,
+    )
+    w.warmup(DEVICE)
+    return w
+
+
+def _random_codes(seq_len, batch=1, device=DEVICE):
+    return torch.randint(0, 100, (batch, NUM_QUANTIZERS, seq_len), dtype=torch.long, device=device)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -254,9 +268,9 @@ def test_disabled_wrapper_matches_eager(decoder, wrapper):
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
-def test_batch_size_gt1_falls_back(decoder, wrapper):
-    """Batch size > 1 should fall back to eager (bit-identical)."""
-    codes = torch.randint(0, 100, (2, NUM_QUANTIZERS, 25), dtype=torch.long, device=DEVICE)
+def test_uncaptured_batch_size_falls_back(decoder, wrapper):
+    """B>1 with BS=1-only wrapper should fall back to eager (bit-identical)."""
+    codes = _random_codes(25, batch=2)
     with torch.no_grad():
         eager_out = decoder(codes)
         graph_out = wrapper.decode(codes)
@@ -269,4 +283,67 @@ def test_deterministic_across_calls(decoder, wrapper):
     with torch.no_grad():
         out1 = wrapper.decode(codes)
         out2 = wrapper.decode(codes)
+    torch.testing.assert_close(out1, out2, atol=0, rtol=0)
+
+
+# ──────────────────────────────────────────────────────────────────
+# 6. Batched graph replay (capture_batch_sizes=[1, 2, 4])
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+@pytest.mark.parametrize("seq_len", [25, 50, 100])
+def test_batched_exact_size_bit_identical(decoder, batched_wrapper, batch_size, seq_len):
+    """Batched graph replay at exact capture sizes must be bit-identical to eager."""
+    codes = _random_codes(seq_len, batch=batch_size)
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = batched_wrapper.decode(codes)
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("batch_size", [2, 4])
+@pytest.mark.parametrize("seq_len", [10, 30, 73])
+def test_batched_padded_output_shape(decoder, batched_wrapper, batch_size, seq_len):
+    """Batched padded decode must return output trimmed to actual length."""
+    codes = _random_codes(seq_len, batch=batch_size)
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = batched_wrapper.decode(codes)
+    expected_len = seq_len * TOTAL_UPSAMPLE
+    assert graph_out.shape == eager_out.shape
+    assert graph_out.shape[-1] == expected_len
+
+
+def test_batched_uncaptured_batch_size_falls_back(decoder, batched_wrapper):
+    """B=3 with capture_batch_sizes=[1,2,4] falls back to eager (bit-identical)."""
+    codes = _random_codes(25, batch=3)
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = batched_wrapper.decode(codes)
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("batch_size", [2, 4])
+def test_batched_chunked_decode(decoder, batched_wrapper, batch_size):
+    """Batched chunked_decode_with_cudagraph at exact chunk sizes."""
+    codes = _random_codes(50, batch=batch_size)
+    chunk_size, ctx = 50, 0
+    with torch.no_grad():
+        eager_out = _eager_chunked(decoder, codes, chunk_size, ctx)
+        graph_out = batched_wrapper.chunked_decode_with_cudagraph(
+            codes,
+            chunk_size=chunk_size,
+            left_context_size=ctx,
+        )
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+def test_batched_deterministic_across_calls(decoder, batched_wrapper, batch_size):
+    """Same batched input should produce identical graph output across calls."""
+    codes = _random_codes(30, batch=batch_size)
+    with torch.no_grad():
+        out1 = batched_wrapper.decode(codes)
+        out2 = batched_wrapper.decode(codes)
     torch.testing.assert_close(out1, out2, atol=0, rtol=0)
