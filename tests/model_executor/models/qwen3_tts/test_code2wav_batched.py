@@ -76,6 +76,20 @@ def _sequential_decode(decoder, codes_list):
     return results
 
 
+def _assert_output_lengths(bat_wavs, lengths):
+    """Assert each batched output has the correct length (L * TOTAL_UPSAMPLE)."""
+    expected = [L * TOTAL_UPSAMPLE for L in lengths]
+    actual = [w.shape[0] for w in bat_wavs]
+    assert expected == actual, f"Shape mismatch: expected {expected}, got {actual}"
+
+
+def _assert_interior_close(bat_wavs, seq_wavs, boundary=3 * TOTAL_UPSAMPLE, atol=1e-5, rtol=1e-5):
+    """Assert interior samples (away from padding boundary) match between batched and sequential."""
+    for bat_wav, seq_wav in zip(bat_wavs, seq_wavs):
+        if seq_wav.shape[0] > boundary:
+            torch.testing.assert_close(bat_wav[:-boundary], seq_wav[:-boundary], atol=atol, rtol=rtol)
+
+
 def _batched_decode(decoder, codes_list, upsample):
     """Pad, stack, single batched chunked_decode, trim per-request."""
     actual_frames = [c.shape[1] for c in codes_list]
@@ -123,11 +137,9 @@ def test_same_length_close(decoder, seq_len, batch_size):
         seq_wavs = _sequential_decode(decoder, codes_list)
         bat_wavs = _batched_decode(decoder, codes_list, TOTAL_UPSAMPLE)
 
-    for i in range(batch_size):
-        if batch_size == 1:
-            torch.testing.assert_close(bat_wavs[i], seq_wavs[i], atol=0, rtol=0)
-        else:
-            torch.testing.assert_close(bat_wavs[i], seq_wavs[i], atol=1e-5, rtol=1e-4)
+    atol, rtol = (0, 0) if batch_size == 1 else (1e-5, 1e-4)
+    for bat_wav, seq_wav in zip(bat_wavs, seq_wavs):
+        torch.testing.assert_close(bat_wav, seq_wav, atol=atol, rtol=rtol)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -143,10 +155,7 @@ def test_variable_length_output_shapes(decoder, lengths):
     with torch.no_grad():
         bat_wavs = _batched_decode(decoder, codes_list, TOTAL_UPSAMPLE)
 
-    for i, L in enumerate(lengths):
-        assert bat_wavs[i].shape[0] == L * TOTAL_UPSAMPLE, (
-            f"Request {i}: expected {L * TOTAL_UPSAMPLE}, got {bat_wavs[i].shape[0]}"
-        )
+    _assert_output_lengths(bat_wavs, lengths)
 
 
 @pytest.mark.parametrize("lengths", [[10, 25], [25, 50, 100], [7, 13, 50, 80]])
@@ -163,12 +172,7 @@ def test_variable_length_interior_close(decoder, lengths):
         seq_wavs = _sequential_decode(decoder, codes_list)
         bat_wavs = _batched_decode(decoder, codes_list, TOTAL_UPSAMPLE)
 
-    boundary = 3 * TOTAL_UPSAMPLE
-    for i in range(len(lengths)):
-        if seq_wavs[i].shape[0] > boundary:
-            interior_seq = seq_wavs[i][:-boundary]
-            interior_bat = bat_wavs[i][:-boundary]
-            torch.testing.assert_close(interior_bat, interior_seq, atol=1e-5, rtol=1e-5)
+    _assert_interior_close(bat_wavs, seq_wavs)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -206,13 +210,8 @@ def test_long_sequences_chunked_internally(decoder, lengths):
         seq_wavs = _sequential_decode(decoder, codes_list)
         bat_wavs = _batched_decode(decoder, codes_list, TOTAL_UPSAMPLE)
 
-    boundary = 3 * TOTAL_UPSAMPLE
-    for i, L in enumerate(lengths):
-        assert bat_wavs[i].shape[0] == L * TOTAL_UPSAMPLE
-        if seq_wavs[i].shape[0] > boundary:
-            interior_seq = seq_wavs[i][:-boundary]
-            interior_bat = bat_wavs[i][:-boundary]
-            torch.testing.assert_close(interior_bat, interior_seq, atol=1e-5, rtol=1e-5)
+    _assert_output_lengths(bat_wavs, lengths)
+    _assert_interior_close(bat_wavs, seq_wavs)
 
 
 # ──────────────────────────────────────────────────────────────────
