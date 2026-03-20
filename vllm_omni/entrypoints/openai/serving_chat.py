@@ -109,6 +109,35 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _diffusion_engine: Optional["AsyncOmniDiffusion"] = None
     _diffusion_model_name: str = ""
 
+    async def warmup(self) -> None:
+        """Warm up chat template processing if a template is available.
+
+        Models that do not use the chat completions API (e.g. TTS models)
+        may not define a chat template in their tokenizer.  The parent
+        warmup would raise ChatTemplateResolutionError in that case, so
+        we check for a resolvable template first and skip gracefully.
+        """
+        from vllm.renderers.hf import resolve_chat_template
+
+        tokenizer = self.renderer.get_tokenizer()
+        resolved = resolve_chat_template(
+            tokenizer,
+            chat_template=getattr(self, "chat_template", None),
+            tools=None,
+            model_config=self.model_config,
+        )
+
+        if resolved is None:
+            logger.info(
+                "Skipping chat template warmup: no chat template found "
+                "for tokenizer '%s'. This is expected for models that "
+                "do not use the chat completions API (e.g. TTS models).",
+                tokenizer.name_or_path,
+            )
+            return
+
+        await super().warmup()
+
     @classmethod
     def for_diffusion(
         cls,
