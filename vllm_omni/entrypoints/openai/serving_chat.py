@@ -119,19 +119,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         """
         from vllm.renderers.hf import resolve_chat_template
 
+        # resolve_chat_template
+        # We must call it before super().warmup() because the parent catches
+        # Exceptions internally and logs an ERROR traceback which we want to
+        # avoid for models that legitimately have no chat template (e.g. TTS).
         tokenizer = self.renderer.get_tokenizer()
         resolved = resolve_chat_template(
             tokenizer,
-            chat_template=getattr(self, "chat_template", None),
+            chat_template=self.chat_template,
             tools=None,
             model_config=self.model_config,
         )
 
         if resolved is None:
             logger.info(
-                "Skipping chat template warmup: no chat template found "
-                "for tokenizer '%s'. This is expected for models that "
-                "do not use the chat completions API (e.g. TTS models).",
+                "No chat template found for '%s', skipping warmup.",
                 tokenizer.name_or_path,
             )
             return

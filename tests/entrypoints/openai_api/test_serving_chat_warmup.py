@@ -1,30 +1,30 @@
 """Tests for OmniOpenAIServingChat.warmup() chat template handling."""
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
+
+from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
 
 def _make_mock_serving_chat():
-    """Build a minimal OmniOpenAIServingChat without a real engine."""
-    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
-
-    instance = object.__new__(OmniOpenAIServingChat)
-    instance.chat_template = None
-    instance.chat_template_content_format = "auto"
-    instance.default_chat_template_kwargs = {}
+    """Build a mock OmniOpenAIServingChat using create_autospec."""
+    instance = create_autospec(OmniOpenAIServingChat, instance=True)
 
     mock_tokenizer = MagicMock()
     mock_tokenizer.name_or_path = "test-model"
 
     mock_renderer = MagicMock()
     mock_renderer.get_tokenizer.return_value = mock_tokenizer
-
     instance.renderer = mock_renderer
+
+    instance.chat_template = None
 
     mock_model_config = MagicMock()
     mock_model_config.trust_remote_code = False
     mock_model_config.hf_config.model_type = "test"
     instance.model_config = mock_model_config
+
+    instance.warmup = OmniOpenAIServingChat.warmup.__get__(instance)
 
     return instance
 
