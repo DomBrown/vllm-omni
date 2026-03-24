@@ -130,10 +130,13 @@ class Qwen3TTSCode2Wav(nn.Module):
                         chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
                         left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
 
+                    max_batch = self.vllm_config.scheduler_config.max_num_seqs
+
                     decoder.enable_cudagraph(
                         device=device,
                         codec_chunk_frames=chunk_frames,
                         codec_left_context_frames=left_frames,
+                        max_batch_size=max_batch,
                     )
                     logger.info("Code2Wav decoder CUDA Graph enabled")
                 except Exception:

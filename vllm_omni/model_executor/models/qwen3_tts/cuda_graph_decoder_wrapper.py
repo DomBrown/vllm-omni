@@ -35,7 +35,7 @@ class CUDAGraphDecoderWrapper:
         capture_sizes: list[int] | None = None,
         num_quantizers: int = 8,
         enabled: bool = True,
-        max_batch_size: int = 8,
+        max_batch_size: int = 1,
     ):
         self.decoder = decoder
         self._explicit_sizes = capture_sizes is not None
