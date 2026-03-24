@@ -24,6 +24,7 @@ pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA req
 
 DEVICE = torch.device("cuda:0")
 NUM_QUANTIZERS = 8
+MAX_BATCH_SIZE = 4
 TOTAL_UPSAMPLE = 4
 
 # Load CUDAGraphDecoderWrapper: try package import first, fall back to direct file load
@@ -89,7 +90,7 @@ def wrapper(decoder):
         capture_sizes=[25, 50, 100],
         num_quantizers=NUM_QUANTIZERS,
         enabled=True,
-        max_batch_size=4,
+        max_batch_size=MAX_BATCH_SIZE,
     )
     w.warmup(DEVICE)
     return w
@@ -257,7 +258,15 @@ def test_disabled_wrapper_matches_eager(decoder, wrapper):
 
 def test_batch_exceeds_max_falls_back(decoder, wrapper):
     """Batch size exceeding max_batch_size falls back to eager (bit-identical)."""
-    codes = _random_codes(25, batch_size=5)
+    overflow_bs = MAX_BATCH_SIZE + 1
+    padded_batch = wrapper._get_padded_batch_size(overflow_bs)
+    assert padded_batch is None, f"Padded batch size {padded_batch} should be None"
+    padded_size = wrapper._get_padded_size(25)
+    assert (overflow_bs, padded_size) not in wrapper.graphs, (
+        f"Graph should not be captured for {overflow_bs}, {padded_size}"
+    )
+
+    codes = _random_codes(25, batch_size=overflow_bs)
     with torch.no_grad():
         eager_out = decoder(codes)
         graph_out = wrapper.decode(codes)
