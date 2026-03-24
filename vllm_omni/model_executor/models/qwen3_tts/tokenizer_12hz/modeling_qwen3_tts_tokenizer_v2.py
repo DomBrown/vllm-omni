@@ -974,6 +974,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         device: torch.device | None = None,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
+        max_batch_size: int = 8,
     ):
         from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
 
@@ -988,6 +989,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             capture_sizes=capture_sizes,
             num_quantizers=self.config.num_quantizers,
             enabled=True,
+            max_batch_size=max_batch_size,
         )
         self._cudagraph_wrapper.warmup(
             device,

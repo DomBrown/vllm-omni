@@ -83,19 +83,20 @@ def decoder():
 
 @pytest.fixture(scope="module")
 def wrapper(decoder):
-    """Create a warmed-up CUDAGraphDecoderWrapper."""
+    """Create a warmed-up CUDAGraphDecoderWrapper with batch support."""
     w = CUDAGraphDecoderWrapper(
         decoder=decoder,
         capture_sizes=[25, 50, 100],
         num_quantizers=NUM_QUANTIZERS,
         enabled=True,
+        max_batch_size=4,
     )
     w.warmup(DEVICE)
     return w
 
 
-def _random_codes(seq_len, device=DEVICE):
-    return torch.randint(0, 100, (1, NUM_QUANTIZERS, seq_len), dtype=torch.long, device=device)
+def _random_codes(seq_len, batch_size=1, device=DEVICE):
+    return torch.randint(0, 100, (batch_size, NUM_QUANTIZERS, seq_len), dtype=torch.long, device=device)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -254,9 +255,9 @@ def test_disabled_wrapper_matches_eager(decoder, wrapper):
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
-def test_batch_size_gt1_falls_back(decoder, wrapper):
-    """Batch size > 1 should fall back to eager (bit-identical)."""
-    codes = torch.randint(0, 100, (2, NUM_QUANTIZERS, 25), dtype=torch.long, device=DEVICE)
+def test_batch_exceeds_max_falls_back(decoder, wrapper):
+    """Batch size exceeding max_batch_size falls back to eager (bit-identical)."""
+    codes = _random_codes(25, batch_size=5)
     with torch.no_grad():
         eager_out = decoder(codes)
         graph_out = wrapper.decode(codes)
@@ -273,7 +274,95 @@ def test_deterministic_across_calls(decoder, wrapper):
 
 
 # ──────────────────────────────────────────────────────────────────
-# 6. compute_capture_sizes
+# 6. Batched decode correctness
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("seq_len", [25, 50, 100])
+def test_batched_exact_size_numerical_equivalence(decoder, wrapper, seq_len):
+    """B=2, exact capture size: graph output must be bit-identical to eager."""
+    codes = _random_codes(seq_len, batch_size=2)
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = wrapper.decode(codes)
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("seq_len", [10, 30, 47])
+def test_batched_padded_numerical_equivalence(decoder, wrapper, seq_len):
+    """B=2 padded: each element must match its individual B=1 eager decode.
+
+    Decodes each element individually via eager and compares against the
+    batched graph output element-by-element, proving no cross-batch
+    contamination from zero-padded batch slots.
+    """
+    codes = _random_codes(seq_len, batch_size=2)
+    with torch.no_grad():
+        eager_0 = decoder(codes[0:1])
+        eager_1 = decoder(codes[1:2])
+        graph_out = wrapper.decode(codes)
+
+    boundary = 3 * TOTAL_UPSAMPLE
+    for eager_single, batch_idx in [(eager_0, 0), (eager_1, 1)]:
+        graph_single = graph_out[batch_idx : batch_idx + 1]
+        assert graph_single.shape == eager_single.shape
+        if eager_single.shape[-1] > boundary:
+            torch.testing.assert_close(
+                graph_single[..., :-boundary],
+                eager_single[..., :-boundary],
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        max_diff = (graph_single - eager_single).abs().max().item()
+        assert max_diff < 1.0, f"Batch element {batch_idx} max diff {max_diff}"
+
+
+def test_batched_different_from_zeros(decoder, wrapper):
+    """B=2 where slot 1 is all zeros: slot 0 must match its B=1 eager decode.
+
+    Directly tests that zero-padded batch slots don't corrupt real slots.
+    """
+    real_codes = _random_codes(25, batch_size=1)
+    zero_codes = torch.zeros(1, NUM_QUANTIZERS, 25, dtype=torch.long, device=DEVICE)
+    batched = torch.cat([real_codes, zero_codes], dim=0)
+
+    with torch.no_grad():
+        eager_single = decoder(real_codes)
+        graph_out = wrapper.decode(batched)
+
+    torch.testing.assert_close(graph_out[0:1], eager_single, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("total_len", [50, 100])
+def test_batched_chunked_decode_equivalence(decoder, wrapper, total_len):
+    """B=2 chunked decode: each element must match individual eager chunked decode."""
+    codes = _random_codes(total_len, batch_size=2)
+    chunk_size, ctx = 50, 0
+
+    with torch.no_grad():
+        eager_0 = _eager_chunked(decoder, codes[0:1], chunk_size, ctx)
+        eager_1 = _eager_chunked(decoder, codes[1:2], chunk_size, ctx)
+        graph_out = wrapper.chunked_decode_with_cudagraph(
+            codes,
+            chunk_size=chunk_size,
+            left_context_size=ctx,
+        )
+
+    torch.testing.assert_close(graph_out[0:1], eager_0, atol=0, rtol=0)
+    torch.testing.assert_close(graph_out[1:2], eager_1, atol=0, rtol=0)
+
+
+def test_batched_deterministic_across_calls(decoder, wrapper):
+    """B=2 same input twice: must produce bit-identical output."""
+    codes = _random_codes(30, batch_size=2)
+    with torch.no_grad():
+        out1 = wrapper.decode(codes)
+        out2 = wrapper.decode(codes)
+    torch.testing.assert_close(out1, out2, atol=0, rtol=0)
+
+
+# ──────────────────────────────────────────────────────────────────
+# 7. compute_capture_sizes
 # ──────────────────────────────────────────────────────────────────
 
 
@@ -304,7 +393,7 @@ def test_compute_capture_sizes(kwargs, expected_in, not_expected):
 
 
 # ──────────────────────────────────────────────────────────────────
-# 7. SnakeBeta Triton kernel vs eager equivalence
+# 8. SnakeBeta Triton kernel vs eager equivalence
 # ──────────────────────────────────────────────────────────────────
 
 

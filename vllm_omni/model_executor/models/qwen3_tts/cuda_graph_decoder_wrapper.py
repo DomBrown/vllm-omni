@@ -35,19 +35,25 @@ class CUDAGraphDecoderWrapper:
         capture_sizes: list[int] | None = None,
         num_quantizers: int = 8,
         enabled: bool = True,
+        max_batch_size: int = 8,
     ):
         self.decoder = decoder
         self._explicit_sizes = capture_sizes is not None
         self.capture_sizes = sorted(capture_sizes) if capture_sizes else []
         self.num_quantizers = num_quantizers
         self.enabled = enabled
+        self.max_batch_size = max_batch_size
+        self.batch_sizes = sorted(
+            {1} | {2**i for i in range(max_batch_size.bit_length() + 1) if 2**i <= max_batch_size}
+        )
 
-        self.graphs: dict[int, CUDAGraph] = {}
-        self.static_inputs: dict[int, torch.Tensor] = {}
-        self.static_outputs: dict[int, torch.Tensor] = {}
+        self.graphs: dict[tuple[int, int], CUDAGraph] = {}
+        self.static_inputs: dict[tuple[int, int], torch.Tensor] = {}
+        self.static_outputs: dict[tuple[int, int], torch.Tensor] = {}
 
         self._warmed_up = False
         self._device = None
+        self._memory_pool = None
 
     @staticmethod
     def compute_capture_sizes(
@@ -82,6 +88,12 @@ class CUDAGraphDecoderWrapper:
                 return size
         return None
 
+    def _get_padded_batch_size(self, actual_batch: int) -> int | None:
+        for bs in self.batch_sizes:
+            if actual_batch <= bs:
+                return bs
+        return None
+
     def warmup(
         self,
         device: torch.device,
@@ -101,57 +113,73 @@ class CUDAGraphDecoderWrapper:
                 codec_left_context_frames=codec_left_context_frames,
             )
 
-        logger.info("Starting CUDA Graph warmup for %d sizes: %s", len(self.capture_sizes), self.capture_sizes)
+        num_graphs = len(self.batch_sizes) * len(self.capture_sizes)
+        logger.info(
+            "Starting CUDA Graph warmup for %d batch_sizes=%s x %d sizes: %s",
+            len(self.batch_sizes),
+            self.batch_sizes,
+            len(self.capture_sizes),
+            self.capture_sizes,
+        )
 
-        # Warmup runs to ensure CUDA memory is allocated
-        for size in self.capture_sizes:
-            dummy = torch.zeros(1, self.num_quantizers, size, dtype=dtype, device=device)
-            with torch.no_grad():
-                _ = self.decoder(dummy)
+        for bs in self.batch_sizes:
+            for size in self.capture_sizes:
+                dummy = torch.zeros(bs, self.num_quantizers, size, dtype=dtype, device=device)
+                with torch.no_grad():
+                    _ = self.decoder(dummy)
 
         torch.cuda.synchronize(device)
 
-        for size in self.capture_sizes:
-            try:
-                self._capture(size, device, dtype)
-                logger.info("  Captured CUDA Graph for size=%d", size)
-            except Exception:
-                logger.warning("  Failed to capture graph for size=%d", size, exc_info=True)
+        for bs in self.batch_sizes:
+            for size in self.capture_sizes:
+                try:
+                    self._capture(bs, size, device, dtype)
+                    logger.info("  Captured CUDA Graph for batch=%d size=%d", bs, size)
+                except Exception:
+                    logger.warning("  Failed to capture graph for batch=%d size=%d", bs, size, exc_info=True)
 
         self._warmed_up = True
-        logger.info("CUDA Graph warmup complete: %d/%d captured", len(self.graphs), len(self.capture_sizes))
+        logger.info("CUDA Graph warmup complete: %d/%d captured", len(self.graphs), num_graphs)
 
-    def _capture(self, size: int, device: torch.device, dtype: torch.dtype):
-        static_input = torch.zeros(1, self.num_quantizers, size, dtype=dtype, device=device)
+    def _capture(self, batch_size: int, size: int, device: torch.device, dtype: torch.dtype):
+        static_input = torch.zeros(batch_size, self.num_quantizers, size, dtype=dtype, device=device)
         with torch.no_grad():
             _ = self.decoder(static_input)
         torch.cuda.synchronize(device)
 
         graph = CUDAGraph()
         with torch.no_grad():
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, pool=self._memory_pool):
                 static_output = self.decoder(static_input)
 
-        self.graphs[size] = graph
-        self.static_inputs[size] = static_input
-        self.static_outputs[size] = static_output
+        if self._memory_pool is None:
+            self._memory_pool = graph.pool()
+
+        key = (batch_size, size)
+        self.graphs[key] = graph
+        self.static_inputs[key] = static_input
+        self.static_outputs[key] = static_output
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
-        if not self.enabled or not self._warmed_up or codes.shape[0] != 1:
+        if not self.enabled or not self._warmed_up:
             return self.decoder(codes)
 
-        actual_size = codes.shape[-1]
-        padded_size = self._get_padded_size(actual_size)
+        padded_batch = self._get_padded_batch_size(codes.shape[0])
+        padded_size = self._get_padded_size(codes.shape[-1])
 
-        if padded_size is None or padded_size not in self.graphs:
+        if padded_batch is None or padded_size is None:
             return self.decoder(codes)
 
-        self.static_inputs[padded_size].zero_()
-        self.static_inputs[padded_size][:, :, :actual_size] = codes
-        self.graphs[padded_size].replay()
+        key = (padded_batch, padded_size)
+        if key not in self.graphs:
+            return self.decoder(codes)
 
-        actual_out_len = actual_size * self.decoder.total_upsample
-        return self.static_outputs[padded_size][..., :actual_out_len].clone()
+        self.static_inputs[key].zero_()
+        self.static_inputs[key][: codes.shape[0], :, : codes.shape[-1]] = codes
+        self.graphs[key].replay()
+
+        actual_out_len = codes.shape[-1] * self.decoder.total_upsample
+        return self.static_outputs[key][: codes.shape[0], ..., :actual_out_len].clone()
 
     def chunked_decode_with_cudagraph(
         self,

@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.utils.hub import cached_file
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -270,13 +271,21 @@ class Qwen3TTSCode2Wav(nn.Module):
             except Exception:
                 pass
 
-        # Decode directly via decoder.chunked_decode(), staying entirely on GPU.
-        # Each request decoded individually with CUDA graph replay at bs=1.
+        # Decode via decoder.chunked_decode(), staying entirely on GPU.
+        # Batched path pads all requests to max frame count and decodes in
+        # a single call; single-request path keeps the B=1 CUDA graph fast path.
         wav_tensors: list[torch.Tensor] = []
-        for codes_qf in valid_codes_qf:
-            codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
+        if len(valid_codes_qf) == 1:
+            codes_bqf = valid_codes_qf[0].unsqueeze(0)  # [1, Q, F]
             wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
             wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
+        else:
+            max_f = max(c.shape[1] for c in valid_codes_qf)
+            actual_f = [c.shape[1] for c in valid_codes_qf]
+            padded = torch.stack([F.pad(c, (0, max_f - c.shape[1])) for c in valid_codes_qf])  # [B, Q, max_f]
+            wav_batch = decoder.chunked_decode(padded)  # [B, 1, wav_len_max]
+            for i in range(len(valid_codes_qf)):
+                wav_tensors.append(wav_batch[i, 0, : actual_f[i] * upsample])
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
